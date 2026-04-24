@@ -62,32 +62,6 @@ MAX_QUESTION_LENGTH = 300
 st.set_page_config(page_title="광고 데이터 AI 분석", layout="wide")
 
 # -----------------------------
-# ★ 임시 디버그 — 진단 후 삭제 예정
-# -----------------------------
-with st.expander("🔧 Secrets 진단 (배포 문제 해결용)", expanded=True):
-    try:
-        keys = list(st.secrets.keys())
-        st.write("Secrets 최상위 keys:", keys)
-
-        if "gcp_service_account" in st.secrets:
-            gsa = st.secrets["gcp_service_account"]
-            st.write("gcp_service_account keys:", list(gsa.keys()))
-            pk = gsa.get("private_key", "")
-            st.write("private_key 길이:", len(pk))
-            st.write("private_key 시작:", repr(pk[:50]) if pk else "(없음)")
-            st.write("private_key 끝:", repr(pk[-50:]) if pk else "(없음)")
-            st.success("✅ gcp_service_account 섹션 인식됨")
-        else:
-            st.error("❌ gcp_service_account 섹션이 Secrets에 없습니다.")
-
-        if "GEMINI_API_KEY" in st.secrets:
-            st.success(f"✅ GEMINI_API_KEY 인식됨 (길이: {len(st.secrets['GEMINI_API_KEY'])})")
-        else:
-            st.warning("⚠️ GEMINI_API_KEY가 Secrets에 없습니다.")
-    except Exception as e:
-        st.error(f"Secrets 접근 오류: {e}")
-
-# -----------------------------
 # UI
 # -----------------------------
 st.title("📊 광고 데이터 AI 분석 MVP")
@@ -170,7 +144,8 @@ def validate_sql(sql: str) -> tuple[bool, str]:
 # -----------------------------
 # BigQuery 클라이언트 (견고한 예외 처리)
 # -----------------------------
-def get_bq_client(project_id: str) -> bigquery.Client:
+@st.cache_resource
+def get_bq_client() -> bigquery.Client:
     """환경에 따라 BigQuery 클라이언트 반환 (로컬 / Streamlit Cloud 모두 지원)"""
     # Streamlit Cloud: secrets.toml의 gcp_service_account 사용
     try:
@@ -180,7 +155,7 @@ def get_bq_client(project_id: str) -> bigquery.Client:
                 dict(st.secrets["gcp_service_account"]),
                 scopes=["https://www.googleapis.com/auth/cloud-platform"],
             )
-            return bigquery.Client(project=project_id, credentials=credentials)
+            return bigquery.Client(project=PROJECT_ID, credentials=credentials)
     except Exception as e:
         raise RuntimeError(
             f"Streamlit Secrets의 gcp_service_account 설정 오류입니다. "
@@ -189,7 +164,7 @@ def get_bq_client(project_id: str) -> bigquery.Client:
 
     # 로컬: GOOGLE_APPLICATION_CREDENTIALS 환경변수 사용
     try:
-        return bigquery.Client(project=project_id)
+        return bigquery.Client(project=PROJECT_ID)
     except Exception as e:
         raise RuntimeError(
             "BigQuery 인증에 실패했습니다.\n"
@@ -203,15 +178,15 @@ def get_bq_client(project_id: str) -> bigquery.Client:
 # Step 1: 템플릿 로드 (BigQuery)
 # -----------------------------
 @st.cache_data(ttl=300)
-def load_templates(project_id: str) -> list[dict]:
+def load_templates() -> list[dict]:
     """mart_question_template_cache에서 템플릿 목록을 로드"""
-    client = get_bq_client(project_id)
+    client = get_bq_client()
     sql = f"""
         SELECT
             template_id, template_name, question_type,
             required_filter_1, required_filter_2, required_filter_3,
             kpi_field, output_type, sql_group_by
-        FROM `{project_id}.{DATASET_ID}.mart_question_template_cache`
+        FROM `{PROJECT_ID}.{DATASET_ID}.mart_question_template_cache`
         ORDER BY template_id
     """
     df = client.query(sql).to_dataframe()
@@ -402,7 +377,7 @@ if question:
     genai.configure(api_key=api_key)
 
     try:
-        templates = load_templates(PROJECT_ID)
+        templates = load_templates()
 
         with st.spinner("질문 유형을 분류하고 있습니다..."):
             q_type, t_id = classify_with_gemini(question, templates)
@@ -425,7 +400,7 @@ if question:
             st.error(f"SQL 안전 규칙 미통과: {error_message}")
             st.stop()
 
-        bq_client = get_bq_client(PROJECT_ID)
+        bq_client = get_bq_client()
         with st.spinner("BigQuery에서 결과를 조회하고 있습니다..."):
             df = bq_client.query(safe_sql).to_dataframe()
 
