@@ -1,0 +1,6 @@
+streamlit
+google-cloud-bigquery
+google-generativeai
+google-auth
+pandas
+db-dtypes
