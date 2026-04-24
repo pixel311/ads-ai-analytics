@@ -1,0 +1,433 @@
+import os
+import re
+import json
+from typing import Optional
+
+import google.generativeai as genai
+import pandas as pd
+import streamlit as st
+from google.cloud import bigquery
+
+# -----------------------------
+# 기본 설정
+# -----------------------------
+PROJECT_ID = "ads-analytics-project-493908"
+DATASET_ID = "ads_analytics"
+
+# 테이블 매핑
+# 테이블 매핑 (캐시 테이블 사용 — Sheets 직접 참조 우회)
+TABLE_MAP = {
+    "kpi_lookup":          f"`{PROJECT_ID}.{DATASET_ID}.mart_ai_query_cache`",
+    "channel_compare":     f"`{PROJECT_ID}.{DATASET_ID}.mart_ai_query_cache`",
+    "product_compare":     f"`{PROJECT_ID}.{DATASET_ID}.mart_ai_query_cache`",
+    "benchmark_compare":   f"`{PROJECT_ID}.{DATASET_ID}.mart_ai_query_cache`",
+    "performance_check":   f"`{PROJECT_ID}.{DATASET_ID}.mart_ai_query_cache`",
+    "top_performer_query": f"`{PROJECT_ID}.{DATASET_ID}.mart_ai_query_cache`",
+    "recommendation":      f"`{PROJECT_ID}.{DATASET_ID}.fact_mix_recommendation_result`",
+    "simulation":          f"`{PROJECT_ID}.{DATASET_ID}.mart_mix_simulation_cache`",
+    "trend":               f"`{PROJECT_ID}.{DATASET_ID}.mart_channel_monthly_performance_cache`",
+}
+
+# 테이블별 허용 컬럼
+COLUMN_MAP = {
+    f"`{PROJECT_ID}.{DATASET_ID}.mart_ai_query_cache`": """
+  advertiser_name, channel, media_product, objective_type, primary_kpi,
+  impressions, clicks, ctr, cpc, roas, spend_ratio,
+  benchmark_ctr, benchmark_cpc, benchmark_roas,
+  ctr_diff, cpc_diff, roas_diff""",
+
+    f"`{PROJECT_ID}.{DATASET_ID}.fact_mix_recommendation_result`": """
+  recommendation_id, advertiser_name, industry_name, objective_type,
+  total_budget, recommended_mix, expected_ctr, expected_cpc, expected_roas,
+  confidence_score, recommendation_reason, created_at""",
+
+    f"`{PROJECT_ID}.{DATASET_ID}.mart_mix_simulation_cache`": """
+  scenario_id, advertiser_name, industry_name, objective_type,
+  total_budget, ratio_google, ratio_meta, budget_google, budget_meta,
+  google_pred_ctr, google_pred_cpc, google_pred_roas,
+  meta_pred_ctr, meta_pred_cpc, meta_pred_roas,
+  predicted_roas, predicted_cpc, predicted_ctr""",
+
+    f"`{PROJECT_ID}.{DATASET_ID}.mart_channel_monthly_performance_cache`": """
+  month, advertiser_name, industry_name, channel, media_product,
+  objective_type, primary_kpi, spend, impressions, clicks, conversions,
+  avg_ctr, avg_cpc, avg_cvr, avg_cpa, avg_roas""",
+}
+
+ALLOWED_TABLES = {t.replace("`", "").lower() for t in TABLE_MAP.values()}
+
+MODEL_NAME = "gemini-2.5-flash"
+DEFAULT_LIMIT = 100
+MAX_QUESTION_LENGTH = 300
+
+st.set_page_config(page_title="광고 데이터 AI 분석", layout="wide")
+
+# -----------------------------
+# UI
+# -----------------------------
+st.title("📊 광고 데이터 AI 분석 MVP")
+st.write("질문만 입력하면 AI가 SQL을 생성하고 BigQuery 결과를 보여줍니다.")
+st.caption(
+    "예시: ABC쇼핑 ROAS 알려줘 / Conversion 캠페인 CTR / benchmark 대비 성과 / "
+    "5천만 예산 추천 믹스 / 채널별 월간 트렌드"
+)
+
+question = st.text_input(
+    "질문 입력",
+    placeholder="예: ABC쇼핑 5천만 예산 추천 믹스 / Google vs Meta 시나리오 / 채널별 월간 ROAS"
+)
+
+# -----------------------------
+# 환경 변수
+# -----------------------------
+api_key = os.getenv("GEMINI_API_KEY")
+
+# -----------------------------
+# 유틸 함수
+# -----------------------------
+def normalize_sql(sql: str) -> str:
+    sql = sql.strip()
+    sql = re.sub(r"^```sql\s*", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"^```\s*", "", sql)
+    sql = re.sub(r"\s*```$", "", sql)
+    sql = sql.strip().rstrip(";").strip()
+    return sql
+
+
+def contains_forbidden_keyword(sql: str) -> Optional[str]:
+    forbidden_patterns = [
+        r"\bINSERT\b", r"\bUPDATE\b", r"\bDELETE\b", r"\bMERGE\b",
+        r"\bDROP\b",   r"\bALTER\b",  r"\bTRUNCATE\b", r"\bCREATE\b",
+        r"\bREPLACE\b", r"\bGRANT\b", r"\bREVOKE\b",
+        r"\bEXECUTE\b", r"\bCALL\b",
+    ]
+    for pattern in forbidden_patterns:
+        if re.search(pattern, sql, flags=re.IGNORECASE):
+            return pattern
+    return None
+
+
+def is_select_only(sql: str) -> bool:
+    sql_stripped = sql.strip().lower()
+    return sql_stripped.startswith("select") or sql_stripped.startswith("with")
+
+
+def references_only_allowed_tables(sql: str) -> bool:
+    sql_lower = sql.lower().replace("`", "")
+    refs = re.findall(r"\b(?:from|join)\s+([a-zA-Z0-9_.-]+)", sql_lower)
+    if not refs:
+        return False
+    for ref in refs:
+        if ref not in ALLOWED_TABLES:
+            return False
+    return True
+
+
+def enforce_limit(sql: str, limit: int = DEFAULT_LIMIT) -> str:
+    if re.search(r"\blimit\s+\d+\b", sql, flags=re.IGNORECASE):
+        return sql
+    return f"{sql}\nLIMIT {limit}"
+
+
+def validate_sql(sql: str) -> tuple[bool, str]:
+    if not sql:
+        return False, "SQL이 비어 있습니다."
+    if not is_select_only(sql):
+        return False, "SELECT 쿼리만 허용됩니다."
+    forbidden = contains_forbidden_keyword(sql)
+    if forbidden:
+        return False, f"허용되지 않는 SQL 키워드: {forbidden}"
+    if not references_only_allowed_tables(sql):
+        return False, "허용된 테이블만 참조해야 합니다."
+    return True, ""
+
+
+# -----------------------------
+# Step 1: 템플릿 로드 (BigQuery)
+# -----------------------------
+@st.cache_data(ttl=300)  # 5분 캐시 — 시트 동기화 주기 고려
+def load_templates(project_id: str) -> list[dict]:
+    """mart_question_template에서 템플릿 목록을 로드"""
+    client = bigquery.Client(project=project_id)
+    sql = f"""
+        SELECT
+            template_id, template_name, question_type,
+            required_filter_1, required_filter_2, required_filter_3,
+            kpi_field, output_type, sql_group_by
+        FROM `{project_id}.{DATASET_ID}.mart_question_template_cache`
+        ORDER BY template_id
+    """
+    df = client.query(sql).to_dataframe()
+    return df.to_dict(orient="records")
+
+
+# -----------------------------
+# Step 2: Gemini로 question_type 분류
+# -----------------------------
+def classify_with_gemini(user_question: str, templates: list[dict]) -> tuple[str, str]:
+    """
+    템플릿 목록을 Gemini에게 전달해 question_type과 template_id를 분류.
+    Returns (question_type, template_id)
+    """
+    template_summary = "\n".join([
+        f"- template_id={t['template_id']}, question_type={t['question_type']}, "
+        f"template_name={t['template_name']}, "
+        f"filters={t['required_filter_1']}/{t['required_filter_2']}/{t['required_filter_3']}"
+        for t in templates
+    ])
+
+    prompt = f"""
+아래는 광고 데이터 분석 시스템의 질문 템플릿 목록이야.
+
+{template_summary}
+
+사용자 질문: "{user_question}"
+
+위 템플릿 중 사용자 질문과 가장 잘 맞는 템플릿을 하나 골라서
+아래 JSON 형식으로만 응답해. 다른 말은 하지 마.
+
+{{"question_type": "...", "template_id": "..."}}
+""".strip()
+
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        system_instruction="너는 질문 분류 시스템이다. JSON만 출력한다.",
+    )
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(temperature=0),
+    )
+
+    raw = response.text.strip()
+    raw = re.sub(r"^```json\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"^```\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        result = json.loads(raw)
+        return result.get("question_type", "kpi_lookup"), result.get("template_id", "T01")
+    except Exception:
+        return "kpi_lookup", "T01"
+
+
+# -----------------------------
+# Step 3: question_type → SQL 생성
+# -----------------------------
+def build_sql_prompt(user_question: str, question_type: str, template: dict) -> str:
+    table = TABLE_MAP.get(question_type, TABLE_MAP["kpi_lookup"])
+    columns = COLUMN_MAP.get(table, "")
+    group_by_hint = template.get("sql_group_by") or ""
+    kpi_field = template.get("kpi_field") or ""
+
+    return f"""
+너는 광고 데이터 분석가야.
+사용자의 자연어 질문을 BigQuery Standard SQL로 변환해.
+
+사용 가능한 테이블: {table}
+사용 가능한 컬럼:{columns}
+
+규칙:
+1. BigQuery Standard SQL만 사용
+2. SQL만 출력 (마크다운·설명 없이)
+3. {table} 만 참조할 것
+4. SELECT 문만 생성
+5. 존재하지 않는 컬럼 사용 금지
+6. 기본 LIMIT {DEFAULT_LIMIT}
+7. 집계 필요 시 GROUP BY 사용
+8. 권장 GROUP BY: {group_by_hint}
+9. 핵심 KPI 컬럼: {kpi_field}
+10. 날짜 컬럼이 없는 테이블에는 날짜 필터 사용 금지
+
+사용자 질문: {user_question}
+""".strip()
+
+
+def generate_sql(user_question: str, question_type: str, template: dict) -> str:
+    prompt = build_sql_prompt(user_question, question_type, template)
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        system_instruction="너는 SQL만 생성하는 분석 보조 시스템이다.",
+    )
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(temperature=0),
+    )
+    sql = response.text or ""
+    return normalize_sql(sql)
+
+
+# -----------------------------
+# Step 4: AI 응답 요약
+# -----------------------------
+SUMMARY_PERSPECTIVE = {
+    "kpi_lookup":          "광고주의 핵심 KPI 수치와 성과를 평가하는 관점",
+    "channel_compare":     "매체별 KPI 차이와 효율 우위를 비교하는 관점",
+    "product_compare":     "미디어 상품별 성과 격차와 투자 효율 관점",
+    "benchmark_compare":   "내부 성과와 업계 benchmark 대비 강점/약점 관점",
+    "performance_check":   "성과가 양호한지 미흡한지 평가하는 관점",
+    "top_performer_query": "상위 성과 채널의 공통 특성과 교훈 관점",
+    "recommendation":      "추천 믹스 선택 이유와 기대 효과를 설명하는 관점",
+    "simulation":          "시나리오별 예상 KPI 차이와 트레이드오프 관점",
+    "trend":               "시계열 추이와 변화 방향을 포착하는 관점",
+}
+
+
+def summarize_result(user_question: str, question_type: str, df: pd.DataFrame) -> str:
+    """
+    BigQuery 결과를 자연어로 요약.
+    상위 20행만 Gemini에 전달하여 토큰 절약.
+    """
+    perspective = SUMMARY_PERSPECTIVE.get(question_type, "데이터 분석 관점")
+
+    # 상위 20행만 전달 (토큰 절약)
+    sample_df = df.head(20)
+    data_text = sample_df.to_string(index=False)
+    row_count = len(df)
+
+    prompt = f"""
+너는 광고 데이터 분석가야. 아래 BigQuery 조회 결과를 광고주 담당자에게 설명해야 해.
+
+[사용자 질문]
+{user_question}
+
+[분석 관점]
+{perspective}
+
+[조회 결과 — 총 {row_count}행 중 상위 {len(sample_df)}행]
+{data_text}
+
+위 데이터를 기반으로 아래 형식으로만 응답해. 마크다운이나 코드블록은 쓰지 말 것.
+
+📊 핵심 요약
+- (1줄)
+- (1줄)
+- (1줄)
+
+💡 실행 제안
+- (1~2줄 실행 가능한 액션)
+
+각 불릿은 구체적 수치를 포함할 것. 추측이나 일반론은 배제할 것.
+""".strip()
+
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        system_instruction="너는 광고 데이터 인사이트 요약 전문가다.",
+    )
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(temperature=0.3),
+    )
+    return (response.text or "").strip()
+
+
+# -----------------------------
+# 결과 표시 레이블
+# -----------------------------
+TYPE_LABELS = {
+    "kpi_lookup":          "📊 KPI 조회",
+    "channel_compare":     "📊 매체별 KPI 비교",
+    "product_compare":     "📊 상품별 KPI 비교",
+    "benchmark_compare":   "📊 Benchmark 비교",
+    "performance_check":   "📊 성과 평가",
+    "top_performer_query": "📊 상위 성과 조회",
+    "recommendation":      "🎯 미디어 믹스 추천",
+    "simulation":          "🔬 예산 시나리오 시뮬레이션",
+    "trend":               "📈 채널 월간 트렌드",
+}
+
+# -----------------------------
+# 실행
+# -----------------------------
+if question:
+    if len(question.strip()) == 0:
+        st.warning("질문을 입력해 주세요.")
+        st.stop()
+
+    if len(question) > MAX_QUESTION_LENGTH:
+        st.warning(f"질문은 {MAX_QUESTION_LENGTH}자 이하로 입력해 주세요.")
+        st.stop()
+
+    if not api_key:
+        st.error("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
+        st.stop()
+
+    genai.configure(api_key=api_key)
+
+    try:
+        # 템플릿 로드
+        templates = load_templates(PROJECT_ID)
+
+        # Step 1: Gemini로 question_type 분류
+        with st.spinner("질문 유형을 분류하고 있습니다..."):
+            q_type, t_id = classify_with_gemini(question, templates)
+
+        # 매칭된 템플릿 찾기
+        matched = next((t for t in templates if t["template_id"] == t_id), templates[0])
+
+        label = TYPE_LABELS.get(q_type, "📊 조회")
+        st.info(f"질문 유형: **{label}** (템플릿: {t_id} · {matched['template_name']})")
+
+        # Step 2: SQL 생성
+        with st.spinner("AI가 SQL을 생성하고 있습니다..."):
+            raw_sql = generate_sql(question, q_type, matched)
+            safe_sql = enforce_limit(raw_sql, DEFAULT_LIMIT)
+            is_valid, error_message = validate_sql(safe_sql)
+
+        st.subheader("생성된 SQL")
+        with st.expander("🔍 생성된 SQL 보기 (디버깅용)", expanded=False):
+            st.code(safe_sql, language="sql")
+
+        if not is_valid:
+            st.error(f"SQL 안전 규칙 미통과: {error_message}")
+            st.stop()
+
+        # Step 3: BigQuery 실행
+        bq_client = bigquery.Client(project=PROJECT_ID)
+        with st.spinner("BigQuery에서 결과를 조회하고 있습니다..."):
+            df = bq_client.query(safe_sql).to_dataframe()
+
+        st.subheader("조회 결과")
+
+        if df.empty:
+            st.info("조회 결과가 없습니다. 질문 조건을 더 넓게 입력해 보세요.")
+        else:
+            if q_type == "recommendation" and "recommendation_reason" in df.columns:
+                st.success("✅ 최적 미디어 믹스 추천 결과입니다.")
+                highlight_cols = ["recommended_mix", "expected_roas", "confidence_score", "recommendation_reason"]
+                st.dataframe(df[[c for c in highlight_cols if c in df.columns]], use_container_width=True)
+                with st.expander("전체 컬럼 보기"):
+                    st.dataframe(df, use_container_width=True)
+            elif q_type == "simulation" and "predicted_roas" in df.columns:
+                st.info("🔬 시나리오별 예상 KPI 결과입니다.")
+                st.dataframe(df, use_container_width=True)
+            else:
+                st.dataframe(df, use_container_width=True)
+
+            # AI 요약
+            st.subheader("🧠 AI 인사이트 요약")
+            with st.spinner("AI가 결과를 요약하고 있습니다..."):
+                try:
+                    summary = summarize_result(question, q_type, df)
+                    if summary:
+                        st.markdown(summary)
+                    else:
+                        st.caption("요약 결과가 비어있습니다.")
+                except Exception as summary_err:
+                    st.caption(f"요약 생성 중 일시 오류: {summary_err}")
+
+            csv = df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="결과 CSV 다운로드",
+                data=csv,
+                file_name="query_result.csv",
+                mime="text/csv",
+            )
+
+    except Exception as e:
+        st.error(
+            f"오류가 발생했습니다. 질문을 더 구체적으로 입력하거나 "
+            f"지원되는 KPI/필터 기준으로 다시 시도해 주세요.\n\n상세 오류: {e}"
+        )
+
+else:
+    st.info("질문을 입력하면 실행됩니다.")
