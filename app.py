@@ -14,7 +14,6 @@ from google.cloud import bigquery
 PROJECT_ID = "ads-analytics-project-493908"
 DATASET_ID = "ads_analytics"
 
-# 테이블 매핑
 # 테이블 매핑 (캐시 테이블 사용 — Sheets 직접 참조 우회)
 TABLE_MAP = {
     "kpi_lookup":          f"`{PROJECT_ID}.{DATASET_ID}.mart_ai_query_cache`",
@@ -63,6 +62,32 @@ MAX_QUESTION_LENGTH = 300
 st.set_page_config(page_title="광고 데이터 AI 분석", layout="wide")
 
 # -----------------------------
+# ★ 임시 디버그 — 진단 후 삭제 예정
+# -----------------------------
+with st.expander("🔧 Secrets 진단 (배포 문제 해결용)", expanded=True):
+    try:
+        keys = list(st.secrets.keys())
+        st.write("Secrets 최상위 keys:", keys)
+
+        if "gcp_service_account" in st.secrets:
+            gsa = st.secrets["gcp_service_account"]
+            st.write("gcp_service_account keys:", list(gsa.keys()))
+            pk = gsa.get("private_key", "")
+            st.write("private_key 길이:", len(pk))
+            st.write("private_key 시작:", repr(pk[:50]) if pk else "(없음)")
+            st.write("private_key 끝:", repr(pk[-50:]) if pk else "(없음)")
+            st.success("✅ gcp_service_account 섹션 인식됨")
+        else:
+            st.error("❌ gcp_service_account 섹션이 Secrets에 없습니다.")
+
+        if "GEMINI_API_KEY" in st.secrets:
+            st.success(f"✅ GEMINI_API_KEY 인식됨 (길이: {len(st.secrets['GEMINI_API_KEY'])})")
+        else:
+            st.warning("⚠️ GEMINI_API_KEY가 Secrets에 없습니다.")
+    except Exception as e:
+        st.error(f"Secrets 접근 오류: {e}")
+
+# -----------------------------
 # UI
 # -----------------------------
 st.title("📊 광고 데이터 AI 분석 MVP")
@@ -78,9 +103,9 @@ question = st.text_input(
 )
 
 # -----------------------------
-# 환경 변수
+# 환경 변수 (로컬) / secrets (Streamlit Cloud)
 # -----------------------------
-api_key = os.getenv("GEMINI_API_KEY")
+api_key = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
 
 # -----------------------------
 # 유틸 함수
@@ -143,12 +168,44 @@ def validate_sql(sql: str) -> tuple[bool, str]:
 
 
 # -----------------------------
+# BigQuery 클라이언트 (견고한 예외 처리)
+# -----------------------------
+def get_bq_client(project_id: str) -> bigquery.Client:
+    """환경에 따라 BigQuery 클라이언트 반환 (로컬 / Streamlit Cloud 모두 지원)"""
+    # Streamlit Cloud: secrets.toml의 gcp_service_account 사용
+    try:
+        if "gcp_service_account" in st.secrets:
+            from google.oauth2 import service_account
+            credentials = service_account.Credentials.from_service_account_info(
+                dict(st.secrets["gcp_service_account"]),
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            return bigquery.Client(project=project_id, credentials=credentials)
+    except Exception as e:
+        raise RuntimeError(
+            f"Streamlit Secrets의 gcp_service_account 설정 오류입니다. "
+            f"Settings → Secrets에서 private_key 전체 내용을 확인해주세요.\n\n상세: {e}"
+        )
+
+    # 로컬: GOOGLE_APPLICATION_CREDENTIALS 환경변수 사용
+    try:
+        return bigquery.Client(project=project_id)
+    except Exception as e:
+        raise RuntimeError(
+            "BigQuery 인증에 실패했습니다.\n"
+            "- 로컬 실행: GOOGLE_APPLICATION_CREDENTIALS 환경변수 확인\n"
+            "- Streamlit Cloud: Secrets에 [gcp_service_account] 섹션 추가 필요\n\n"
+            f"상세: {e}"
+        )
+
+
+# -----------------------------
 # Step 1: 템플릿 로드 (BigQuery)
 # -----------------------------
-@st.cache_data(ttl=300)  # 5분 캐시 — 시트 동기화 주기 고려
+@st.cache_data(ttl=300)
 def load_templates(project_id: str) -> list[dict]:
-    """mart_question_template에서 템플릿 목록을 로드"""
-    client = bigquery.Client(project=project_id)
+    """mart_question_template_cache에서 템플릿 목록을 로드"""
+    client = get_bq_client(project_id)
     sql = f"""
         SELECT
             template_id, template_name, question_type,
@@ -165,10 +222,6 @@ def load_templates(project_id: str) -> list[dict]:
 # Step 2: Gemini로 question_type 분류
 # -----------------------------
 def classify_with_gemini(user_question: str, templates: list[dict]) -> tuple[str, str]:
-    """
-    템플릿 목록을 Gemini에게 전달해 question_type과 template_id를 분류.
-    Returns (question_type, template_id)
-    """
     template_summary = "\n".join([
         f"- template_id={t['template_id']}, question_type={t['question_type']}, "
         f"template_name={t['template_name']}, "
@@ -273,13 +326,8 @@ SUMMARY_PERSPECTIVE = {
 
 
 def summarize_result(user_question: str, question_type: str, df: pd.DataFrame) -> str:
-    """
-    BigQuery 결과를 자연어로 요약.
-    상위 20행만 Gemini에 전달하여 토큰 절약.
-    """
     perspective = SUMMARY_PERSPECTIVE.get(question_type, "데이터 분석 관점")
 
-    # 상위 20행만 전달 (토큰 절약)
     sample_df = df.head(20)
     data_text = sample_df.to_string(index=False)
     row_count = len(df)
@@ -348,26 +396,22 @@ if question:
         st.stop()
 
     if not api_key:
-        st.error("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
+        st.error("GEMINI_API_KEY가 설정되지 않았습니다.")
         st.stop()
 
     genai.configure(api_key=api_key)
 
     try:
-        # 템플릿 로드
         templates = load_templates(PROJECT_ID)
 
-        # Step 1: Gemini로 question_type 분류
         with st.spinner("질문 유형을 분류하고 있습니다..."):
             q_type, t_id = classify_with_gemini(question, templates)
 
-        # 매칭된 템플릿 찾기
         matched = next((t for t in templates if t["template_id"] == t_id), templates[0])
 
         label = TYPE_LABELS.get(q_type, "📊 조회")
         st.info(f"질문 유형: **{label}** (템플릿: {t_id} · {matched['template_name']})")
 
-        # Step 2: SQL 생성
         with st.spinner("AI가 SQL을 생성하고 있습니다..."):
             raw_sql = generate_sql(question, q_type, matched)
             safe_sql = enforce_limit(raw_sql, DEFAULT_LIMIT)
@@ -381,8 +425,7 @@ if question:
             st.error(f"SQL 안전 규칙 미통과: {error_message}")
             st.stop()
 
-        # Step 3: BigQuery 실행
-        bq_client = bigquery.Client(project=PROJECT_ID)
+        bq_client = get_bq_client(PROJECT_ID)
         with st.spinner("BigQuery에서 결과를 조회하고 있습니다..."):
             df = bq_client.query(safe_sql).to_dataframe()
 
