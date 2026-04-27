@@ -30,8 +30,8 @@ TABLE_MAP = {
 # 테이블별 허용 컬럼
 COLUMN_MAP = {
     f"`{PROJECT_ID}.{DATASET_ID}.mart_ai_query_cache`": """
-  advertiser_name, channel, media_product, objective_type, primary_kpi,
-  impressions, clicks, ctr, cpc, roas, spend_ratio,
+  advertiser_name, industry_name, channel, media_product, objective_type, primary_kpi,
+  impressions, clicks, ctr, cpc, cvr, cpa, roas, spend_ratio,
   benchmark_ctr, benchmark_cpc, benchmark_roas,
   ctr_diff, cpc_diff, roas_diff""",
 
@@ -377,6 +377,18 @@ def build_sql_prompt(
 9. 핵심 KPI 컬럼: {kpi_field}
 10. 날짜 컬럼이 없는 테이블에는 날짜 필터 사용 금지{dim_hint}
 
+그룹화 키워드 매핑 (사용자가 "~별"로 요청하면 해당 컬럼으로 GROUP BY):
+- "업종별"        → GROUP BY industry_name (이 경우 SELECT에도 industry_name 반드시 포함)
+- "매체별/채널별" → GROUP BY channel
+- "상품별"        → GROUP BY media_product
+- "광고주별"      → GROUP BY advertiser_name
+- "목적별"        → GROUP BY objective_type
+- "월별"          → GROUP BY month (해당 컬럼 있을 때만)
+
+집계 컬럼 처리:
+- 집계 시 수치형 컬럼은 SUM 또는 AVG로 묶을 것 (impressions/clicks → SUM, ctr/cpc/roas → AVG)
+- GROUP BY에 포함되지 않은 컬럼은 SELECT에서 제거할 것
+
 사용자 질문: {user_question}
 """.strip()
 
@@ -531,9 +543,35 @@ if question:
         # (너무 좁은 조건부터 점차 풀어줌)
         FALLBACK_ORDER = ["objective_type", "primary_kpi", "media_product", "channel"]
 
+        # 오류 분류: 재시도 가능 vs 불가
+        def is_retryable_error(err_msg: str) -> bool:
+            """일시적 오류로 판단되어 재시도 가능한 오류인지 분류"""
+            err_lower = err_msg.lower()
+            retryable_keywords = [
+                "rate limit", "429",                    # API 한도
+                "timeout", "deadline exceeded",         # 타임아웃
+                "no matching signature",                # AI가 생성한 SQL 타입 오류 (재생성 시 해결 가능)
+                "unrecognized name",                    # AI가 잘못된 컬럼명 추측
+                "syntax error",                         # 문법 오류 (재생성 시 해결 가능)
+                "internal", "503", "500",               # 서버 일시 오류
+            ]
+            non_retryable_keywords = [
+                "permission", "denied", "403",          # 권한 (재시도해도 안됨)
+                "not found", "does not exist", "404",   # 리소스 없음
+                "quota exceeded",                       # 할당량 초과 (대기 필요)
+            ]
+            for kw in non_retryable_keywords:
+                if kw in err_lower:
+                    return False
+            for kw in retryable_keywords:
+                if kw in err_lower:
+                    return True
+            return False  # 분류 불가 시 안전하게 재시도 안함
+
         df = None
         used_skip_dims: list = []
         attempted_queries: list = []
+        retry_messages: list = []  # 사용자에게 안내할 재시도 메시지
 
         for skip_count in range(len(FALLBACK_ORDER) + 1):
             skip_dims = [
@@ -541,27 +579,69 @@ if question:
                 if d in active_dims
             ]
 
-            with st.spinner(
-                "AI가 SQL을 생성하고 있습니다..." if skip_count == 0
-                else f"조건을 완화하여 재조회 중 (제외: {', '.join(skip_dims)})..."
-            ):
-                raw_sql = generate_sql(question, q_type, matched, matched_dims, skip_dims)
-                safe_sql = enforce_limit(raw_sql, DEFAULT_LIMIT)
-                is_valid, error_message = validate_sql(safe_sql)
+            # 한 폴백 단계에서 최대 2회 재시도 (1차 + 1회 재생성)
+            MAX_RETRY = 2
+            success = False
+            last_error = None
 
-            attempted_queries.append((skip_dims, safe_sql))
+            for retry_n in range(MAX_RETRY):
+                spinner_msg = (
+                    "AI가 SQL을 생성하고 있습니다..." if (skip_count == 0 and retry_n == 0)
+                    else f"조건을 완화하여 재조회 중 (제외: {', '.join(skip_dims)})..." if (skip_count > 0 and retry_n == 0)
+                    else f"⏳ 일시 오류로 재시도 중... ({retry_n + 1}/{MAX_RETRY})"
+                )
+                with st.spinner(spinner_msg):
+                    raw_sql = generate_sql(question, q_type, matched, matched_dims, skip_dims)
+                    safe_sql = enforce_limit(raw_sql, DEFAULT_LIMIT)
+                    is_valid, error_message = validate_sql(safe_sql)
 
-            if not is_valid:
-                st.error(f"SQL 안전 규칙 미통과: {error_message}")
+                if not is_valid:
+                    st.error(f"SQL 안전 규칙 미통과: {error_message}")
+                    st.stop()
+
+                try:
+                    df = bq_client.query(safe_sql).to_dataframe()
+                    attempted_queries.append((skip_dims, safe_sql))
+                    success = True
+
+                    # 재시도로 성공한 경우 사용자에게 알림
+                    if retry_n > 0:
+                        retry_messages.append(
+                            f"ℹ️ 1차 시도에서 일시 오류가 발생하여 자동 재시도로 결과를 가져왔습니다."
+                        )
+                    break
+
+                except Exception as q_err:
+                    last_error = str(q_err)
+                    attempted_queries.append((skip_dims, safe_sql))
+
+                    # 재시도 가능 여부 판단
+                    if not is_retryable_error(last_error):
+                        # 재시도 불가 → 즉시 안내하고 종료
+                        st.error(
+                            f"❌ 다시 실행해도 해결되기 어려운 오류입니다.\n\n"
+                            f"**오류 유형**: 권한·리소스·할당량 관련 영구 오류\n\n"
+                            f"**상세**: {last_error}\n\n"
+                            f"💡 관리자 또는 데이터 담당자에게 문의해 주세요."
+                        )
+                        st.stop()
+
+                    # 재시도 가능 → 다음 retry 진행 (마지막 retry면 종료)
+                    if retry_n == MAX_RETRY - 1:
+                        # 모든 재시도 실패
+                        retry_messages.append(
+                            f"⚠️ 자동 재시도를 시도했으나 일시 오류가 계속 발생합니다. 잠시 후 다시 시도해 주세요."
+                        )
+
+            if not success:
+                # 모든 재시도 실패 → 폴백 단계로 넘어가지 않고 종료
+                st.error(
+                    f"❌ {MAX_RETRY}회 재시도에도 쿼리가 성공하지 못했습니다.\n\n"
+                    f"**상세 오류**: {last_error}"
+                )
                 st.stop()
 
-            try:
-                df = bq_client.query(safe_sql).to_dataframe()
-            except Exception as q_err:
-                st.error(f"쿼리 실행 오류: {q_err}")
-                st.stop()
-
-            if not df.empty:
+            if df is not None and not df.empty:
                 used_skip_dims = skip_dims
                 break
 
@@ -572,6 +652,10 @@ if question:
             ]
             if not remaining_to_skip:
                 break
+
+        # 재시도 메시지 표시
+        for msg in retry_messages:
+            st.info(msg)
 
         # 최종 SQL 표시
         st.subheader("생성된 SQL")
