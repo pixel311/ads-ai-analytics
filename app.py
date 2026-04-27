@@ -391,6 +391,13 @@ def build_sql_prompt(
 - 집계 별칭은 가급적 원본 컬럼명을 유지할 것 (예: SUM(impressions) AS impressions)
   부득이 별칭이 필요하면 표준 접두사 사용: avg_, total_, sum_ (예: avg_ctr, total_impressions)
 
+⚠️ mart_ai_query_cache는 이미 집계된 테이블입니다:
+- impressions, clicks 등 수치 컬럼은 이미 SUM된 값입니다 → 추가 집계 시 SUM(impressions) 사용 가능
+- ctr, cpc, roas 등 비율 컬럼은 이미 계산된 값입니다 → 추가 집계 시 AVG(ctr) 사용 가능
+- 절대 금지: AVG(SUM(x)) 같은 이중 집계 — 이미 집계된 컬럼 위에 또 집계 함수 사용
+- "업종별 평균 CTR" 요청 시: SELECT industry_name, AVG(ctr) AS avg_ctr ... GROUP BY industry_name (O)
+- 잘못된 예: SELECT industry_name, AVG(SUM(ctr)) ... (X — Aggregations of aggregations 오류)
+
 사용자 질문: {user_question}
 """.strip()
 
@@ -642,6 +649,9 @@ if question:
                 "no matching signature",                # AI가 생성한 SQL 타입 오류 (재생성 시 해결 가능)
                 "unrecognized name",                    # AI가 잘못된 컬럼명 추측
                 "syntax error",                         # 문법 오류 (재생성 시 해결 가능)
+                "aggregations of aggregations",         # 이미 집계된 컬럼 위에 또 집계
+                "aggregate function",                   # 집계 함수 관련 오류
+                "group by",                             # GROUP BY 누락 등
                 "internal", "503", "500",               # 서버 일시 오류
             ]
             non_retryable_keywords = [
