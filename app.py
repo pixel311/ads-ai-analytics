@@ -50,7 +50,7 @@ COLUMN_MAP = {
     f"`{PROJECT_ID}.{DATASET_ID}.mart_channel_monthly_performance_cache`": """
   month, advertiser_name, industry_name, channel, media_product,
   objective_type, primary_kpi, spend, impressions, clicks, conversions,
-  avg_ctr, avg_cpc, avg_cvr, avg_cpa, avg_roas""",
+  avg_ctr, avg_cpc, avg_roas""",
 }
 
 ALLOWED_TABLES = {t.replace("`", "").lower() for t in TABLE_MAP.values()}
