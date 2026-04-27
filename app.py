@@ -487,6 +487,71 @@ TYPE_LABELS = {
     "trend":               "📈 채널 월간 트렌드",
 }
 
+
+# -----------------------------
+# 결과 표시 — 컬럼 포맷 정의
+# -----------------------------
+# 각 컬럼별 표시 포맷 정의 (원본 데이터는 변경 없음, 표시만 변경)
+# - 비율(%)        : ctr, cvr 등 → 0.0008 → 0.08%
+# - 배수(x)        : roas → 4.0 → 4.00x
+# - 천단위 정수    : impressions, clicks 등 → 33,161,266
+# - 금액(₩)        : cost, cpc 등 → ₩2,755
+# - 차이(diff)     : 양수일 때 + 부호, 음수면 자동
+PERCENT_COLUMNS = {
+    "ctr", "cvr", "ctr_diff",
+    "benchmark_ctr",
+    "spend_ratio",
+}
+MULTIPLIER_COLUMNS = {
+    "roas", "roas_diff",
+    "benchmark_roas",
+    "expected_roas", "predicted_roas",
+}
+INTEGER_COLUMNS = {
+    "impressions", "clicks", "conversions",
+    "video_views",
+    "campaign_count", "ad_group_count",
+    "ratio_google", "ratio_meta",
+}
+CURRENCY_COLUMNS = {
+    "cost", "cpc", "cpa", "cpc_diff",
+    "benchmark_cpc",
+    "spend",
+    "expected_cpc", "predicted_cpc",
+    "total_budget", "budget_google", "budget_meta",
+}
+
+
+def build_column_config(df: pd.DataFrame) -> dict:
+    """DataFrame 컬럼에 맞춰 Streamlit column_config 자동 생성"""
+    config = {}
+    for col in df.columns:
+        col_lower = col.lower()
+        if col_lower in PERCENT_COLUMNS:
+            config[col] = st.column_config.NumberColumn(col, format="%.2f%%")
+        elif col_lower in MULTIPLIER_COLUMNS:
+            config[col] = st.column_config.NumberColumn(col, format="%.2fx")
+        elif col_lower in INTEGER_COLUMNS:
+            config[col] = st.column_config.NumberColumn(col, format="%d")
+        elif col_lower in CURRENCY_COLUMNS:
+            config[col] = st.column_config.NumberColumn(col, format="₩%d")
+    return config
+
+
+def display_dataframe(df: pd.DataFrame) -> None:
+    """포맷이 적용된 DataFrame 표시 (CSV 다운로드는 원본 유지)"""
+    # 비율 컬럼은 %로 표시하기 위해 100을 곱한 사본 사용
+    display_df = df.copy()
+    for col in display_df.columns:
+        if col.lower() in PERCENT_COLUMNS and pd.api.types.is_numeric_dtype(display_df[col]):
+            display_df[col] = display_df[col] * 100
+
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        column_config=build_column_config(display_df),
+    )
+
 # -----------------------------
 # 실행
 # -----------------------------
@@ -702,14 +767,14 @@ if question:
             if q_type == "recommendation" and "recommendation_reason" in df.columns:
                 st.success("✅ 최적 미디어 믹스 추천 결과입니다.")
                 highlight_cols = ["recommended_mix", "expected_roas", "confidence_score", "recommendation_reason"]
-                st.dataframe(df[[c for c in highlight_cols if c in df.columns]], use_container_width=True)
+                display_dataframe(df[[c for c in highlight_cols if c in df.columns]])
                 with st.expander("전체 컬럼 보기"):
-                    st.dataframe(df, use_container_width=True)
+                    display_dataframe(df)
             elif q_type == "simulation" and "predicted_roas" in df.columns:
                 st.info("🔬 시나리오별 예상 KPI 결과입니다.")
-                st.dataframe(df, use_container_width=True)
+                display_dataframe(df)
             else:
-                st.dataframe(df, use_container_width=True)
+                display_dataframe(df)
 
             # AI 요약
             st.subheader("🧠 AI 인사이트 요약")
