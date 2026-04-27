@@ -193,6 +193,64 @@ def load_templates() -> list[dict]:
     return df.to_dict(orient="records")
 
 
+@st.cache_data(ttl=300)
+def load_advertisers() -> list[dict]:
+    """dim_advertiser_cache에서 광고주 마스터 목록 로드"""
+    client = get_bq_client()
+    sql = f"""
+        SELECT advertiser_name, industry_name
+        FROM `{PROJECT_ID}.{DATASET_ID}.dim_advertiser_cache`
+        ORDER BY advertiser_name
+    """
+    df = client.query(sql).to_dataframe()
+    return df.to_dict(orient="records")
+
+
+def match_advertiser_with_gemini(user_question: str, advertisers: list[dict]) -> Optional[str]:
+    """
+    사용자 질문에서 광고주명을 추출 → 마스터 광고주 리스트와 매칭.
+    Returns advertiser_name (정확한 매칭값) 또는 None.
+    """
+    if not advertisers:
+        return None
+
+    advertiser_summary = ", ".join([a["advertiser_name"] for a in advertisers])
+
+    prompt = f"""
+다음은 시스템에 등록된 광고주 마스터 목록이야:
+{advertiser_summary}
+
+사용자 질문: "{user_question}"
+
+위 질문에서 언급된 광고주가 마스터 목록에 있다면, 가장 유사한 advertiser_name을 찾아줘.
+약어, 줄임말, 영문/한글 표기 차이도 매칭해줘 (예: "현대차" → "현대자동차", "kt" → "KT").
+
+아래 JSON 형식으로만 응답해. 다른 말은 하지 마.
+- 매칭되는 광고주가 있으면: {{"matched": "정확한_advertiser_name"}}
+- 광고주 언급이 없거나 매칭 안 되면: {{"matched": null}}
+""".strip()
+
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        system_instruction="너는 광고주 이름 매칭 시스템이다. JSON만 출력한다.",
+    )
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(temperature=0),
+    )
+
+    raw = response.text.strip()
+    raw = re.sub(r"^```json\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"^```\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        result = json.loads(raw)
+        return result.get("matched")
+    except Exception:
+        return None
+
+
 # -----------------------------
 # Step 2: Gemini로 question_type 분류
 # -----------------------------
@@ -241,11 +299,31 @@ def classify_with_gemini(user_question: str, templates: list[dict]) -> tuple[str
 # -----------------------------
 # Step 3: question_type → SQL 생성
 # -----------------------------
-def build_sql_prompt(user_question: str, question_type: str, template: dict) -> str:
+def build_sql_prompt(
+    user_question: str,
+    question_type: str,
+    template: dict,
+    matched_advertiser: Optional[str] = None,
+) -> str:
     table = TABLE_MAP.get(question_type, TABLE_MAP["kpi_lookup"])
     columns = COLUMN_MAP.get(table, "")
     group_by_hint = template.get("sql_group_by") or ""
     kpi_field = template.get("kpi_field") or ""
+
+    # 매칭된 광고주명을 명시적으로 주입 (정확한 단일 매칭 강제)
+    advertiser_hint = ""
+    if matched_advertiser:
+        advertiser_hint = (
+            f"\n11. 광고주 이름 필터는 반드시 다음 정확한 값으로 사용할 것: "
+            f"advertiser_name = '{matched_advertiser}'\n"
+            f"    (사용자 질문에 다른 표기가 있어도 이 정확한 값을 사용해야 함)"
+        )
+    else:
+        # 광고주 매칭 실패 시 LIKE 폴백 허용
+        advertiser_hint = (
+            "\n11. 사용자 질문에 광고주 이름이 언급되었으나 정확히 매칭되지 않은 경우, "
+            "LIKE '%키워드%' 패턴 사용 가능"
+        )
 
     return f"""
 너는 광고 데이터 분석가야.
@@ -264,14 +342,19 @@ def build_sql_prompt(user_question: str, question_type: str, template: dict) -> 
 7. 집계 필요 시 GROUP BY 사용
 8. 권장 GROUP BY: {group_by_hint}
 9. 핵심 KPI 컬럼: {kpi_field}
-10. 날짜 컬럼이 없는 테이블에는 날짜 필터 사용 금지
+10. 날짜 컬럼이 없는 테이블에는 날짜 필터 사용 금지{advertiser_hint}
 
 사용자 질문: {user_question}
 """.strip()
 
 
-def generate_sql(user_question: str, question_type: str, template: dict) -> str:
-    prompt = build_sql_prompt(user_question, question_type, template)
+def generate_sql(
+    user_question: str,
+    question_type: str,
+    template: dict,
+    matched_advertiser: Optional[str] = None,
+) -> str:
+    prompt = build_sql_prompt(user_question, question_type, template, matched_advertiser)
     model = genai.GenerativeModel(
         model_name=MODEL_NAME,
         system_instruction="너는 SQL만 생성하는 분석 보조 시스템이다.",
@@ -378,6 +461,7 @@ if question:
 
     try:
         templates = load_templates()
+        advertisers = load_advertisers()
 
         with st.spinner("질문 유형을 분류하고 있습니다..."):
             q_type, t_id = classify_with_gemini(question, templates)
@@ -387,8 +471,15 @@ if question:
         label = TYPE_LABELS.get(q_type, "📊 조회")
         st.info(f"질문 유형: **{label}** (템플릿: {t_id} · {matched['template_name']})")
 
+        # 광고주 매칭 (AI 매칭 + LIKE 폴백)
+        with st.spinner("광고주를 매칭하고 있습니다..."):
+            matched_advertiser = match_advertiser_with_gemini(question, advertisers)
+
+        if matched_advertiser:
+            st.caption(f"🎯 매칭된 광고주: **{matched_advertiser}**")
+
         with st.spinner("AI가 SQL을 생성하고 있습니다..."):
-            raw_sql = generate_sql(question, q_type, matched)
+            raw_sql = generate_sql(question, q_type, matched, matched_advertiser)
             safe_sql = enforce_limit(raw_sql, DEFAULT_LIMIT)
             is_valid, error_message = validate_sql(safe_sql)
 
