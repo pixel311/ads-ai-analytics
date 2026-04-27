@@ -194,45 +194,65 @@ def load_templates() -> list[dict]:
 
 
 @st.cache_data(ttl=300)
-def load_advertisers() -> list[dict]:
-    """dim_advertiser_cache에서 광고주 마스터 목록 로드"""
+def load_dimension_values() -> dict[str, list[str]]:
+    """dim_dimension_values_cache에서 모든 디멘션 마스터 값 로드"""
     client = get_bq_client()
     sql = f"""
-        SELECT advertiser_name, industry_name
-        FROM `{PROJECT_ID}.{DATASET_ID}.dim_advertiser_cache`
-        ORDER BY advertiser_name
+        SELECT dim, value
+        FROM `{PROJECT_ID}.{DATASET_ID}.dim_dimension_values_cache`
+        ORDER BY dim, value
     """
     df = client.query(sql).to_dataframe()
-    return df.to_dict(orient="records")
+    result: dict[str, list[str]] = {}
+    for _, row in df.iterrows():
+        result.setdefault(row["dim"], []).append(row["value"])
+    return result
 
 
-def match_advertiser_with_gemini(user_question: str, advertisers: list[dict]) -> Optional[str]:
+def match_dimensions_with_gemini(
+    user_question: str,
+    dim_values: dict[str, list[str]],
+) -> dict[str, Optional[str]]:
     """
-    사용자 질문에서 광고주명을 추출 → 마스터 광고주 리스트와 매칭.
-    Returns advertiser_name (정확한 매칭값) 또는 None.
+    사용자 질문에서 광고주명·채널·미디어상품·목적·KPI를 추출 → 마스터 값과 매칭.
+    Returns {dimension_name: matched_value or None}
     """
-    if not advertisers:
-        return None
+    if not dim_values:
+        return {}
 
-    advertiser_summary = ", ".join([a["advertiser_name"] for a in advertisers])
+    summary_lines = []
+    for dim, values in dim_values.items():
+        summary_lines.append(f"- {dim}: {', '.join(values)}")
+    summary = "\n".join(summary_lines)
 
     prompt = f"""
-다음은 시스템에 등록된 광고주 마스터 목록이야:
-{advertiser_summary}
+다음은 시스템에 등록된 디멘션별 마스터 값 목록이야:
+
+{summary}
 
 사용자 질문: "{user_question}"
 
-위 질문에서 언급된 광고주가 마스터 목록에 있다면, 가장 유사한 advertiser_name을 찾아줘.
-약어, 줄임말, 영문/한글 표기 차이도 매칭해줘 (예: "현대차" → "현대자동차", "kt" → "KT").
+위 질문에서 각 디멘션에 해당하는 값이 언급되었는지 판단하고,
+언급됐다면 마스터 목록에서 가장 유사한 값을 찾아줘.
+
+매칭 시 유의사항:
+- 약어, 줄임말, 영문/한글 표기 차이 모두 고려 (예: "현대차"→"현대자동차", "kt"→"KT")
+- 동의어, 변형 표현 모두 매칭 (예: "디멘드젠"→"DemandGen", "디맨드젠"→"DemandGen")
+- 사용자 의도가 명확하지 않으면 null 반환
 
 아래 JSON 형식으로만 응답해. 다른 말은 하지 마.
-- 매칭되는 광고주가 있으면: {{"matched": "정확한_advertiser_name"}}
-- 광고주 언급이 없거나 매칭 안 되면: {{"matched": null}}
+{{
+  "advertiser_name": "정확한_값_또는_null",
+  "channel": "정확한_값_또는_null",
+  "media_product": "정확한_값_또는_null",
+  "objective_type": "정확한_값_또는_null",
+  "primary_kpi": "정확한_값_또는_null"
+}}
 """.strip()
 
     model = genai.GenerativeModel(
         model_name=MODEL_NAME,
-        system_instruction="너는 광고주 이름 매칭 시스템이다. JSON만 출력한다.",
+        system_instruction="너는 광고 데이터 디멘션 매칭 시스템이다. JSON만 출력한다.",
     )
     response = model.generate_content(
         prompt,
@@ -246,9 +266,10 @@ def match_advertiser_with_gemini(user_question: str, advertisers: list[dict]) ->
 
     try:
         result = json.loads(raw)
-        return result.get("matched")
+        # null 문자열 → None 변환
+        return {k: (v if v and v != "null" else None) for k, v in result.items()}
     except Exception:
-        return None
+        return {}
 
 
 # -----------------------------
@@ -303,27 +324,39 @@ def build_sql_prompt(
     user_question: str,
     question_type: str,
     template: dict,
-    matched_advertiser: Optional[str] = None,
+    matched_dims: Optional[dict] = None,
+    skip_dims: Optional[list] = None,
 ) -> str:
+    """
+    matched_dims: AI가 매칭한 디멘션 값들 (예: {"advertiser_name": "현대자동차"})
+    skip_dims: 폴백 시 제외할 디멘션 리스트 (예: ["objective_type"])
+    """
     table = TABLE_MAP.get(question_type, TABLE_MAP["kpi_lookup"])
     columns = COLUMN_MAP.get(table, "")
     group_by_hint = template.get("sql_group_by") or ""
     kpi_field = template.get("kpi_field") or ""
 
-    # 매칭된 광고주명을 명시적으로 주입 (정확한 단일 매칭 강제)
-    advertiser_hint = ""
-    if matched_advertiser:
-        advertiser_hint = (
-            f"\n11. 광고주 이름 필터는 반드시 다음 정확한 값으로 사용할 것: "
-            f"advertiser_name = '{matched_advertiser}'\n"
-            f"    (사용자 질문에 다른 표기가 있어도 이 정확한 값을 사용해야 함)"
+    matched_dims = matched_dims or {}
+    skip_dims = skip_dims or []
+
+    # 매칭된 디멘션 값을 명시적으로 SQL 규칙에 주입
+    dim_rules = []
+    rule_idx = 11
+    for dim, value in matched_dims.items():
+        if value and dim not in skip_dims:
+            dim_rules.append(
+                f"{rule_idx}. {dim} 필터는 반드시 정확한 값으로 사용할 것: "
+                f"{dim} = '{value}'  "
+                f"(사용자 질문의 표기와 다르더라도 이 값을 사용)"
+            )
+            rule_idx += 1
+
+    if not any(matched_dims.values()):
+        dim_rules.append(
+            f"{rule_idx}. 디멘션 매칭이 안된 키워드는 LIKE '%키워드%' 패턴 사용 가능"
         )
-    else:
-        # 광고주 매칭 실패 시 LIKE 폴백 허용
-        advertiser_hint = (
-            "\n11. 사용자 질문에 광고주 이름이 언급되었으나 정확히 매칭되지 않은 경우, "
-            "LIKE '%키워드%' 패턴 사용 가능"
-        )
+
+    dim_hint = "\n" + "\n".join(dim_rules) if dim_rules else ""
 
     return f"""
 너는 광고 데이터 분석가야.
@@ -342,7 +375,7 @@ def build_sql_prompt(
 7. 집계 필요 시 GROUP BY 사용
 8. 권장 GROUP BY: {group_by_hint}
 9. 핵심 KPI 컬럼: {kpi_field}
-10. 날짜 컬럼이 없는 테이블에는 날짜 필터 사용 금지{advertiser_hint}
+10. 날짜 컬럼이 없는 테이블에는 날짜 필터 사용 금지{dim_hint}
 
 사용자 질문: {user_question}
 """.strip()
@@ -352,9 +385,10 @@ def generate_sql(
     user_question: str,
     question_type: str,
     template: dict,
-    matched_advertiser: Optional[str] = None,
+    matched_dims: Optional[dict] = None,
+    skip_dims: Optional[list] = None,
 ) -> str:
-    prompt = build_sql_prompt(user_question, question_type, template, matched_advertiser)
+    prompt = build_sql_prompt(user_question, question_type, template, matched_dims, skip_dims)
     model = genai.GenerativeModel(
         model_name=MODEL_NAME,
         system_instruction="너는 SQL만 생성하는 분석 보조 시스템이다.",
@@ -461,7 +495,7 @@ if question:
 
     try:
         templates = load_templates()
-        advertisers = load_advertisers()
+        dim_values = load_dimension_values()
 
         with st.spinner("질문 유형을 분류하고 있습니다..."):
             q_type, t_id = classify_with_gemini(question, templates)
@@ -471,34 +505,115 @@ if question:
         label = TYPE_LABELS.get(q_type, "📊 조회")
         st.info(f"질문 유형: **{label}** (템플릿: {t_id} · {matched['template_name']})")
 
-        # 광고주 매칭 (AI 매칭 + LIKE 폴백)
-        with st.spinner("광고주를 매칭하고 있습니다..."):
-            matched_advertiser = match_advertiser_with_gemini(question, advertisers)
+        # 멀티 디멘션 매칭 (광고주 / 채널 / 미디어 상품 / 목적 / KPI)
+        with st.spinner("질문 키워드를 매칭하고 있습니다..."):
+            matched_dims = match_dimensions_with_gemini(question, dim_values)
 
-        if matched_advertiser:
-            st.caption(f"🎯 매칭된 광고주: **{matched_advertiser}**")
+        # 매칭 결과 표시
+        active_dims = {k: v for k, v in matched_dims.items() if v}
+        if active_dims:
+            badge_lines = []
+            dim_label_map = {
+                "advertiser_name": "광고주",
+                "channel":         "채널",
+                "media_product":   "미디어 상품",
+                "objective_type":  "목적",
+                "primary_kpi":     "KPI",
+            }
+            for dim, val in active_dims.items():
+                badge_lines.append(f"{dim_label_map.get(dim, dim)}: **{val}**")
+            st.caption("🎯 매칭된 조건 → " + " / ".join(badge_lines))
 
-        with st.spinner("AI가 SQL을 생성하고 있습니다..."):
-            raw_sql = generate_sql(question, q_type, matched, matched_advertiser)
-            safe_sql = enforce_limit(raw_sql, DEFAULT_LIMIT)
-            is_valid, error_message = validate_sql(safe_sql)
+        # SQL 생성 + 단계별 폴백 (조건 완화)
+        bq_client = get_bq_client()
 
+        # 폴백 우선순위: objective_type → primary_kpi → media_product 순서로 제외
+        # (너무 좁은 조건부터 점차 풀어줌)
+        FALLBACK_ORDER = ["objective_type", "primary_kpi", "media_product", "channel"]
+
+        df = None
+        used_skip_dims: list = []
+        attempted_queries: list = []
+
+        for skip_count in range(len(FALLBACK_ORDER) + 1):
+            skip_dims = [
+                d for d in FALLBACK_ORDER[:skip_count]
+                if d in active_dims
+            ]
+
+            with st.spinner(
+                "AI가 SQL을 생성하고 있습니다..." if skip_count == 0
+                else f"조건을 완화하여 재조회 중 (제외: {', '.join(skip_dims)})..."
+            ):
+                raw_sql = generate_sql(question, q_type, matched, matched_dims, skip_dims)
+                safe_sql = enforce_limit(raw_sql, DEFAULT_LIMIT)
+                is_valid, error_message = validate_sql(safe_sql)
+
+            attempted_queries.append((skip_dims, safe_sql))
+
+            if not is_valid:
+                st.error(f"SQL 안전 규칙 미통과: {error_message}")
+                st.stop()
+
+            try:
+                df = bq_client.query(safe_sql).to_dataframe()
+            except Exception as q_err:
+                st.error(f"쿼리 실행 오류: {q_err}")
+                st.stop()
+
+            if not df.empty:
+                used_skip_dims = skip_dims
+                break
+
+            # 폴백할 조건이 더 없으면 종료
+            remaining_to_skip = [
+                d for d in FALLBACK_ORDER[skip_count:]
+                if d in active_dims
+            ]
+            if not remaining_to_skip:
+                break
+
+        # 최종 SQL 표시
         st.subheader("생성된 SQL")
         with st.expander("🔍 생성된 SQL 보기 (디버깅용)", expanded=False):
-            st.code(safe_sql, language="sql")
+            for idx, (skip_d, sql) in enumerate(attempted_queries):
+                if len(attempted_queries) > 1:
+                    label_suffix = " (최종)" if idx == len(attempted_queries) - 1 else ""
+                    st.caption(
+                        f"시도 {idx+1}{label_suffix} — "
+                        + (f"제외: {', '.join(skip_d)}" if skip_d else "전체 조건 적용")
+                    )
+                st.code(sql, language="sql")
 
-        if not is_valid:
-            st.error(f"SQL 안전 규칙 미통과: {error_message}")
-            st.stop()
-
-        bq_client = get_bq_client()
-        with st.spinner("BigQuery에서 결과를 조회하고 있습니다..."):
-            df = bq_client.query(safe_sql).to_dataframe()
+        # 폴백 안내
+        if used_skip_dims:
+            skipped_labels = []
+            dim_label_map = {
+                "advertiser_name": "광고주",
+                "channel":         "채널",
+                "media_product":   "미디어 상품",
+                "objective_type":  "목적",
+                "primary_kpi":     "KPI",
+            }
+            for d in used_skip_dims:
+                v = active_dims.get(d, "")
+                skipped_labels.append(f"{dim_label_map.get(d, d)}({v})")
+            st.warning(
+                f"⚠️ 입력하신 조건 중 **{', '.join(skipped_labels)}** 에 해당하는 데이터를 "
+                f"확인하지 못해 해당 조건을 제외하고 결과를 안내드립니다."
+            )
 
         st.subheader("조회 결과")
 
-        if df.empty:
-            st.info("조회 결과가 없습니다. 질문 조건을 더 넓게 입력해 보세요.")
+        if df is None or df.empty:
+            if active_dims:
+                cond_lines = [f"{k}={v}" for k, v in active_dims.items()]
+                st.info(
+                    f"입력하신 조건({', '.join(cond_lines)})으로는 데이터를 찾지 못했습니다.\n\n"
+                    f"💡 일부 조건을 제거하거나, 다른 광고주/기간으로 다시 질문해 주세요."
+                )
+            else:
+                st.info("조회 결과가 없습니다. 질문 조건을 더 넓게 입력해 보세요.")
         else:
             if q_type == "recommendation" and "recommendation_reason" in df.columns:
                 st.success("✅ 최적 미디어 믹스 추천 결과입니다.")
