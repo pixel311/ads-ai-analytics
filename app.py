@@ -388,6 +388,8 @@ def build_sql_prompt(
 집계 컬럼 처리:
 - 집계 시 수치형 컬럼은 SUM 또는 AVG로 묶을 것 (impressions/clicks → SUM, ctr/cpc/roas → AVG)
 - GROUP BY에 포함되지 않은 컬럼은 SELECT에서 제거할 것
+- 집계 별칭은 가급적 원본 컬럼명을 유지할 것 (예: SUM(impressions) AS impressions)
+  부득이 별칭이 필요하면 표준 접두사 사용: avg_, total_, sum_ (예: avg_ctr, total_impressions)
 
 사용자 질문: {user_question}
 """.strip()
@@ -522,18 +524,40 @@ CURRENCY_COLUMNS = {
 }
 
 
+def _matches_category(col: str, category_set: set) -> bool:
+    """
+    컬럼명이 카테고리 세트에 매칭되는지 검사.
+    AI가 생성하는 별칭(total_impressions, avg_ctr, sum_clicks 등)도 인식하도록
+    접두사를 제거하고 비교한다.
+    """
+    col_lower = col.lower()
+
+    # 정확 매칭
+    if col_lower in category_set:
+        return True
+
+    # 접두사 제거 후 매칭 (avg_ctr → ctr, total_impressions → impressions, sum_cost → cost)
+    PREFIXES = ("avg_", "total_", "sum_", "max_", "min_", "median_", "p50_", "p90_")
+    for prefix in PREFIXES:
+        if col_lower.startswith(prefix):
+            stripped = col_lower[len(prefix):]
+            if stripped in category_set:
+                return True
+
+    return False
+
+
 def build_column_config(df: pd.DataFrame) -> dict:
     """DataFrame 컬럼에 맞춰 Streamlit column_config 자동 생성"""
     config = {}
     for col in df.columns:
-        col_lower = col.lower()
-        if col_lower in PERCENT_COLUMNS:
+        if _matches_category(col, PERCENT_COLUMNS):
             config[col] = st.column_config.NumberColumn(col, format="%.2f%%")
-        elif col_lower in MULTIPLIER_COLUMNS:
+        elif _matches_category(col, MULTIPLIER_COLUMNS):
             config[col] = st.column_config.NumberColumn(col, format="%.2fx")
-        elif col_lower in INTEGER_COLUMNS:
+        elif _matches_category(col, INTEGER_COLUMNS):
             config[col] = st.column_config.NumberColumn(col, format="%d")
-        elif col_lower in CURRENCY_COLUMNS:
+        elif _matches_category(col, CURRENCY_COLUMNS):
             config[col] = st.column_config.NumberColumn(col, format="₩%d")
     return config
 
@@ -543,7 +567,7 @@ def display_dataframe(df: pd.DataFrame) -> None:
     # 비율 컬럼은 %로 표시하기 위해 100을 곱한 사본 사용
     display_df = df.copy()
     for col in display_df.columns:
-        if col.lower() in PERCENT_COLUMNS and pd.api.types.is_numeric_dtype(display_df[col]):
+        if _matches_category(col, PERCENT_COLUMNS) and pd.api.types.is_numeric_dtype(display_df[col]):
             display_df[col] = display_df[col] * 100
 
     st.dataframe(
