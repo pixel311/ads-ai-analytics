@@ -31,7 +31,7 @@ TABLE_MAP = {
 COLUMN_MAP = {
     f"`{PROJECT_ID}.{DATASET_ID}.mart_ai_query_cache`": """
   advertiser_name, industry_name, channel, media_product, objective_type, primary_kpi,
-  impressions, clicks, ctr, cpc, cvr, cpa, roas, spend_ratio,
+  impressions, clicks, ctr, cpc, roas, spend_ratio,
   benchmark_ctr, benchmark_cpc, benchmark_roas,
   ctr_diff, cpc_diff, roas_diff""",
 
@@ -492,13 +492,13 @@ TYPE_LABELS = {
 # 결과 표시 — 컬럼 포맷 정의
 # -----------------------------
 # 각 컬럼별 표시 포맷 정의 (원본 데이터는 변경 없음, 표시만 변경)
-# - 비율(%)        : ctr, cvr 등 → 0.0008 → 0.08%
+# - 비율(%)        : ctr 등 → 0.0008 → 0.08%
 # - 배수(x)        : roas → 4.0 → 4.00x
 # - 천단위 정수    : impressions, clicks 등 → 33,161,266
 # - 금액(₩)        : cost, cpc 등 → ₩2,755
 # - 차이(diff)     : 양수일 때 + 부호, 음수면 자동
 PERCENT_COLUMNS = {
-    "ctr", "cvr", "ctr_diff",
+    "ctr", "ctr_diff",
     "benchmark_ctr",
     "spend_ratio",
 }
@@ -514,7 +514,7 @@ INTEGER_COLUMNS = {
     "ratio_google", "ratio_meta",
 }
 CURRENCY_COLUMNS = {
-    "cost", "cpc", "cpa", "cpc_diff",
+    "cost", "cpc", "cpc_diff",
     "benchmark_cpc",
     "spend",
     "expected_cpc", "predicted_cpc",
